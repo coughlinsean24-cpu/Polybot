@@ -1,0 +1,10 @@
+.env
+data/trades.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+EMERGENCY_STOP

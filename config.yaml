@@ -1,0 +1,24 @@
+polymarket:
+  chain_id: 137  # Polygon
+
+price_feeds:
+  binance_ws: "wss://stream.binance.com:9443/ws/btcusdt@trade"
+  coingecko_url: "https://api.coingecko.com/api/v3/simple/price"
+
+strategy:
+  initial_bet: 5
+  max_bet: 160
+  reset_profit_target: 200
+  min_bankroll: 50  # circuit breaker
+  min_price_delta: 0.15  # % move to consider
+  min_edge: 0.05  # minimum EV to trade
+  max_slippage: 0.02  # reject if spread too wide
+
+risk:
+  max_concurrent_positions: 1
+  cooldown_after_loss: 60  # seconds before next trade
+  max_consecutive_losses: 3  # pause after this many
+
+logging:
+  db_path: "./data/trades.db"
+  log_level: "INFO"
