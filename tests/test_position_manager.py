@@ -16,11 +16,34 @@ def make_config():
             "min_price_delta": 0.15,
             "min_edge": 0.05,
             "max_slippage": 0.02,
+            "bet_mode": "doubling",  # tests are written for doubling mode
+            "kelly_fraction": 0.25,
         },
         "risk": {
             "max_concurrent_positions": 1,
             "cooldown_after_loss": 60,
             "max_consecutive_losses": 3,
+        },
+    }
+
+
+def make_kelly_config():
+    return {
+        "strategy": {
+            "initial_bet": 5,
+            "max_bet": 50,
+            "reset_profit_target": 200,
+            "min_bankroll": 50,
+            "min_price_delta": 0.15,
+            "min_edge": 0.05,
+            "max_slippage": 0.02,
+            "bet_mode": "kelly",
+            "kelly_fraction": 0.25,
+        },
+        "risk": {
+            "max_concurrent_positions": 1,
+            "cooldown_after_loss": 30,
+            "max_consecutive_losses": 5,
         },
     }
 
@@ -141,6 +164,74 @@ class TestPositionManagerState(unittest.TestCase):
         self.assertEqual(state.bankroll, 205.0)
         self.assertEqual(state.consecutive_wins, 1)
         self.assertEqual(state.total_trades, 1)
+
+
+class TestKellySizing(unittest.TestCase):
+    """Tests for the Kelly criterion bet sizing mode."""
+
+    def setUp(self):
+        self.pm = PositionManager(make_kelly_config())
+
+    def test_kelly_mode_set(self):
+        self.assertEqual(self.pm.bet_mode, "kelly")
+        self.assertEqual(self.pm.kelly_fraction, 0.25)
+
+    def test_kelly_with_edge(self):
+        """Kelly should bet more when edge is larger."""
+        small_edge_bet = self.pm.calculate_bet_size(edge=0.05, probability=0.55)
+        large_edge_bet = self.pm.calculate_bet_size(edge=0.20, probability=0.70)
+        self.assertGreater(large_edge_bet, small_edge_bet)
+
+    def test_kelly_respects_max_bet(self):
+        """Kelly should not exceed max_bet."""
+        self.pm.bankroll = 10000.0
+        bet = self.pm.calculate_bet_size(edge=0.30, probability=0.80)
+        self.assertLessEqual(bet, self.pm.max_bet)
+
+    def test_kelly_respects_bankroll(self):
+        """Kelly should not exceed bankroll (but never below initial_bet).
+
+        The bankroll is a virtual Kelly tracker. When bankroll drops below
+        initial_bet (e.g. after a loss), we still bet initial_bet because
+        real solvency is checked by _check_balance_before_trade.
+        """
+        # When bankroll > initial_bet, Kelly is capped at bankroll
+        self.pm.bankroll = 8.0
+        bet = self.pm.calculate_bet_size(edge=0.20, probability=0.70)
+        self.assertLessEqual(bet, 8.0)
+
+        # When bankroll < initial_bet, bet is floored at initial_bet
+        self.pm.bankroll = 3.0
+        bet = self.pm.calculate_bet_size(edge=0.20, probability=0.70)
+        self.assertEqual(bet, self.pm.initial_bet)
+
+    def test_kelly_minimum_is_initial_bet(self):
+        """Kelly should bet at least initial_bet."""
+        bet = self.pm.calculate_bet_size(edge=0.001, probability=0.501)
+        self.assertGreaterEqual(bet, self.pm.initial_bet)
+
+    def test_kelly_no_edge_returns_initial(self):
+        """With zero edge, Kelly falls back to initial_bet."""
+        bet = self.pm.calculate_bet_size(edge=0.0, probability=0.50)
+        self.assertEqual(bet, self.pm.initial_bet)
+
+    def test_flat_mode(self):
+        """Flat mode should always return initial_bet."""
+        pm = PositionManager(make_config())
+        pm.bet_mode = "flat"
+        pm.bankroll = 10000.0
+        bet = pm.calculate_bet_size(edge=0.30, probability=0.80)
+        self.assertEqual(bet, pm.initial_bet)
+
+    def test_kelly_scales_with_bankroll(self):
+        """Larger bankroll should produce larger Kelly bets (up to max_bet)."""
+        self.pm.bankroll = 200.0
+        bet_small = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+
+        self.pm.bankroll = 2000.0
+        bet_large = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+
+        self.assertGreater(bet_large, bet_small)
 
 
 if __name__ == "__main__":

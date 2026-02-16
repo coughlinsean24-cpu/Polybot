@@ -1,6 +1,10 @@
 """
 Real-time BTC price monitoring via Binance WebSocket with CoinGecko fallback.
-Tracks 5-minute rolling price deltas and emits arbitrage signals.
+
+Provides current BTC price and the ability to look up the price at any past
+timestamp within the rolling window.  The Orchestrator uses this to compare
+the live BTC price against the Polymarket "price to beat" (the Chainlink BTC
+price at the start of each 5-minute market window).
 """
 
 import asyncio
@@ -8,12 +12,19 @@ import json
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import aiohttp
 import websockets
 
 logger = logging.getLogger(__name__)
+
+WINDOW_SECONDS = 300  # 5 minutes
+
+# WebSocket keepalive settings
+WS_PING_INTERVAL = 20  # send ping every 20s
+WS_PING_TIMEOUT = 10   # wait up to 10s for pong
+WS_RECONNECT_DELAY = 2  # initial reconnect delay (doubles on each failure, max 60s)
 
 
 @dataclass
@@ -22,46 +33,52 @@ class PricePoint:
     timestamp: float
 
 
-@dataclass
-class ArbitrageSignal:
-    direction: str  # "UP" or "DOWN"
-    delta_pct: float
-    confidence: float
-    btc_price_start: float
-    btc_price_end: float
-    timestamp: float
-
-
 class PriceMonitor:
     def __init__(self, config: dict):
         self.binance_ws_url = config["price_feeds"]["binance_ws"]
         self.coingecko_url = config["price_feeds"]["coingecko_url"]
-        self.min_price_delta = config["strategy"]["min_price_delta"]
 
-        # Rolling 5-minute window of price points (1-sec granularity)
-        self.price_history: deque[PricePoint] = deque(maxlen=600)
+        # Rolling window of price points – keep ~20 min @ 1 sample/sec
+        self.price_history: deque[PricePoint] = deque(maxlen=1200)
         self.current_price: float | None = None
         self._ws_connected = False
         self._running = False
+        self._reconnect_delay = WS_RECONNECT_DELAY
+        self._first_price_time: float | None = None  # when we got our first price
+
+    # ── Lifecycle ───────────────────────────────────────────────────
 
     async def start(self):
-        """Start price monitoring with WebSocket primary + REST fallback."""
+        """Start price monitoring — reconnects automatically on failure."""
         self._running = True
         while self._running:
             try:
                 await self._connect_binance_ws()
             except Exception as e:
-                logger.warning(f"Binance WS failed: {e}, falling back to CoinGecko")
-                await self._poll_coingecko()
+                self._ws_connected = False
+                logger.warning(
+                    f"Binance WS error: {e} — reconnecting in "
+                    f"{self._reconnect_delay}s"
+                )
+                await asyncio.sleep(self._reconnect_delay)
+                # Exponential backoff capped at 60s
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
 
     async def stop(self):
         self._running = False
 
+    # ── Data Sources ────────────────────────────────────────────────
+
     async def _connect_binance_ws(self):
-        """Connect to Binance BTC/USDT trade stream."""
+        """Connect to Binance BTC/USDT trade stream with keepalive pings."""
         logger.info("Connecting to Binance WebSocket...")
-        async with websockets.connect(self.binance_ws_url) as ws:
+        async with websockets.connect(
+            self.binance_ws_url,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        ) as ws:
             self._ws_connected = True
+            self._reconnect_delay = WS_RECONNECT_DELAY  # reset on success
             logger.info("Binance WebSocket connected")
             async for message in ws:
                 if not self._running:
@@ -97,56 +114,55 @@ class PriceMonitor:
     def _record_price(self, price: float):
         now = time.time()
         self.current_price = price
+        if self._first_price_time is None:
+            self._first_price_time = now
+        # Throttle history to ~1 sample per second (Binance sends 100+/sec)
+        if self.price_history and (now - self.price_history[-1].timestamp) < 1.0:
+            return
         self.price_history.append(PricePoint(price=price, timestamp=now))
 
-    def calculate_5min_delta(self) -> float | None:
-        """Calculate price change over the last 5 minutes as a percentage."""
-        if len(self.price_history) < 2:
+    # ── Price Lookups ───────────────────────────────────────────────
+
+    def get_price_at(self, target_ts: float) -> float | None:
+        """
+        Return the BTC price closest to *target_ts* from our history.
+        Returns None if we have no data near that time.
+        """
+        if not self.price_history:
             return None
 
+        best: PricePoint | None = None
+        best_gap = float("inf")
+
+        for pt in self.price_history:
+            gap = abs(pt.timestamp - target_ts)
+            if gap < best_gap:
+                best_gap = gap
+                best = pt
+
+        # Only trust it if within 30 seconds of the target
+        if best and best_gap <= 30:
+            return best.price
+        return None
+
+    def get_window_start_price(self) -> tuple[float | None, float]:
+        """
+        Return (price_at_window_start, window_start_timestamp) for the
+        current 5-minute window.
+        """
+        window_start = (int(time.time()) // WINDOW_SECONDS) * WINDOW_SECONDS
+        price = self.get_price_at(float(window_start))
+        return price, float(window_start)
+
+    def seconds_left_in_window(self) -> float:
+        """How many seconds remain in the current 5-minute window."""
         now = time.time()
-        cutoff = now - 300  # 5 minutes ago
+        window_start = (int(now) // WINDOW_SECONDS) * WINDOW_SECONDS
+        window_end = window_start + WINDOW_SECONDS
+        return max(0.0, window_end - now)
 
-        # Find the oldest price point within our 5-min window
-        oldest = None
-        for point in self.price_history:
-            if point.timestamp >= cutoff:
-                oldest = point
-                break
-
-        if oldest is None or self.current_price is None:
-            return None
-
-        delta_pct = ((self.current_price - oldest.price) / oldest.price) * 100
-        return delta_pct
-
-    def detect_arbitrage_signal(self) -> ArbitrageSignal | None:
-        """Check if current price movement creates an arbitrage opportunity."""
-        delta = self.calculate_5min_delta()
-        if delta is None:
-            return None
-
-        abs_delta = abs(delta)
-        if abs_delta < self.min_price_delta:
-            return None
-
-        # Confidence scales with delta magnitude (capped at 1.0)
-        confidence = min(abs_delta / (self.min_price_delta * 3), 1.0)
-
-        # Find 5-min-ago price
-        now = time.time()
-        cutoff = now - 300
-        start_price = self.current_price
-        for point in self.price_history:
-            if point.timestamp >= cutoff:
-                start_price = point.price
-                break
-
-        return ArbitrageSignal(
-            direction="UP" if delta > 0 else "DOWN",
-            delta_pct=delta,
-            confidence=confidence,
-            btc_price_start=start_price,
-            btc_price_end=self.current_price,
-            timestamp=now,
-        )
+    def has_enough_history(self) -> bool:
+        """Do we have at least 30 seconds of price data?"""
+        if self._first_price_time is None:
+            return False
+        return (time.time() - self._first_price_time) >= 30

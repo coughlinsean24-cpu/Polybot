@@ -1,9 +1,8 @@
-"""Tests for ArbitrageEngine - edge detection and trade decisions."""
+"""Tests for ArbitrageEngine - BTC vs target price trade decisions."""
 
 import unittest
 
 from src.arbitrage_engine import ArbitrageEngine, TradeDecision
-from src.price_monitor import ArbitrageSignal
 from src.polymarket_client import MarketInfo
 
 
@@ -14,34 +13,24 @@ def make_config():
             "max_bet": 160,
             "reset_profit_target": 200,
             "min_bankroll": 50,
-            "min_price_delta": 0.15,
             "min_edge": 0.05,
             "max_slippage": 0.02,
         },
     }
 
 
-def make_signal(direction="UP", delta=0.3, confidence=0.6):
-    return ArbitrageSignal(
-        direction=direction,
-        delta_pct=delta,
-        confidence=confidence,
-        btc_price_start=100000,
-        btc_price_end=100300 if direction == "UP" else 99700,
-        timestamp=1000.0,
-    )
-
-
-def make_market(yes_price=0.55, no_price=0.45):
+def make_market(up_price=0.50, down_price=0.50):
     return MarketInfo(
         condition_id="test",
-        question="Will BTC go up?",
-        yes_token_id="yes_tok",
-        no_token_id="no_tok",
-        yes_price=yes_price,
-        no_price=no_price,
+        question="BTC Up or Down 5m",
+        up_token_id="up_tok",
+        down_token_id="down_tok",
+        up_price=up_price,
+        down_price=down_price,
         end_date="",
         volume=1000,
+        event_start_time="",
+        slug="btc-updown-5m-0",
     )
 
 
@@ -49,58 +38,103 @@ class TestArbitrageEngine(unittest.TestCase):
     def setUp(self):
         self.engine = ArbitrageEngine(make_config())
 
-    def test_rejects_small_edge(self):
-        """Should reject when edge is below minimum."""
-        signal = make_signal(delta=0.15, confidence=0.1)
-        # Price is already high enough that our estimate doesn't beat it
-        market = make_market(yes_price=0.70, no_price=0.30)
-        decision = self.engine.analyze_opportunity(signal, market, 0.70, 0.30)
-        self.assertFalse(decision.should_trade)
+    def test_btc_above_target_bets_up(self):
+        """BTC above target → should bet UP."""
+        market = make_market(up_price=0.50, down_price=0.50)
+        decision = self.engine.analyze_opportunity(
+            btc_price=68600, target_price=68500, market=market, seconds_left=200
+        )
+        self.assertEqual(decision.direction, "UP")
+
+    def test_btc_below_target_bets_down(self):
+        """BTC below target → should bet DOWN."""
+        market = make_market(up_price=0.50, down_price=0.50)
+        decision = self.engine.analyze_opportunity(
+            btc_price=68400, target_price=68500, market=market, seconds_left=200
+        )
+        self.assertEqual(decision.direction, "DOWN")
 
     def test_rejects_wide_spread(self):
         """Should reject when spread is too wide."""
-        signal = make_signal(delta=0.5, confidence=0.8)
-        # Spread = |0.55 + 0.50 - 1.0| = 0.05, which > max_slippage of 0.02
-        decision = self.engine.analyze_opportunity(signal, make_market(), 0.55, 0.50)
+        market = make_market(up_price=0.55, down_price=0.50)  # spread = 0.05
+        decision = self.engine.analyze_opportunity(
+            btc_price=68700, target_price=68500, market=market, seconds_left=200
+        )
         self.assertFalse(decision.should_trade)
         self.assertIn("Spread", decision.reason)
 
+    def test_rejects_small_edge(self):
+        """Should reject when edge is below minimum."""
+        # BTC barely above target, market already prices Up high
+        market = make_market(up_price=0.70, down_price=0.30)
+        decision = self.engine.analyze_opportunity(
+            btc_price=68510, target_price=68500, market=market, seconds_left=200
+        )
+        self.assertFalse(decision.should_trade)
+        self.assertIn("Edge too small", decision.reason)
+
     def test_accepts_good_opportunity(self):
-        """Should accept when edge and spread are favorable."""
-        signal = make_signal(delta=0.5, confidence=0.8)
-        # Tight spread: 0.50 + 0.50 = 1.0
-        decision = self.engine.analyze_opportunity(signal, make_market(), 0.50, 0.50)
+        """Should accept when BTC strongly above target and odds are cheap."""
+        market = make_market(up_price=0.50, down_price=0.50)
+        # BTC is 0.15% above target → significant edge
+        decision = self.engine.analyze_opportunity(
+            btc_price=68600, target_price=68500, market=market, seconds_left=150
+        )
         self.assertTrue(decision.should_trade)
+        self.assertEqual(decision.direction, "UP")
         self.assertGreater(decision.edge, 0.05)
 
-    def test_up_signal_bets_yes(self):
-        signal = make_signal(direction="UP")
-        decision = self.engine.analyze_opportunity(signal, make_market(), 0.50, 0.50)
-        self.assertEqual(decision.direction, "YES")
-
-    def test_down_signal_bets_no(self):
-        signal = make_signal(direction="DOWN")
-        decision = self.engine.analyze_opportunity(signal, make_market(), 0.50, 0.50)
-        self.assertEqual(decision.direction, "NO")
+    def test_rejects_too_close_to_expiry(self):
+        """Should not trade in the last 60 seconds."""
+        market = make_market(up_price=0.50, down_price=0.50)
+        decision = self.engine.analyze_opportunity(
+            btc_price=68700, target_price=68500, market=market, seconds_left=50
+        )
+        self.assertFalse(decision.should_trade)
+        self.assertIn("expiry", decision.reason)
 
     def test_probability_estimate_bounded(self):
-        """Estimated probability should be between 0.40 and 0.85."""
-        # Very large delta
-        signal = make_signal(delta=5.0, confidence=1.0)
-        prob = self.engine._estimate_probability(signal)
-        self.assertLessEqual(prob, 0.85)
-        self.assertGreaterEqual(prob, 0.40)
+        """Estimated probability should be between 0.45 and 0.95."""
+        # Large gap
+        prob = self.engine._estimate_probability(diff_pct=0.5, seconds_left=60)
+        self.assertLessEqual(prob, 0.95)
+        self.assertGreaterEqual(prob, 0.45)
 
-        # Very small delta
-        signal = make_signal(delta=0.01, confidence=0.0)
-        prob = self.engine._estimate_probability(signal)
-        self.assertLessEqual(prob, 0.85)
-        self.assertGreaterEqual(prob, 0.40)
+        # Tiny gap
+        prob = self.engine._estimate_probability(diff_pct=0.001, seconds_left=290)
+        self.assertLessEqual(prob, 0.95)
+        self.assertGreaterEqual(prob, 0.45)
+
+    def test_rejects_tiny_btc_diff(self):
+        """Should reject when BTC diff is too small (noise).
+        Even with a loose min_edge, the 0.005% minimum diff filter kicks in.
+        """
+        engine = ArbitrageEngine({
+            "strategy": {"min_edge": 0.001, "max_slippage": 0.10},
+        })
+        market = make_market(up_price=0.50, down_price=0.50)
+        decision = engine.analyze_opportunity(
+            btc_price=68501.0, target_price=68500, market=market, seconds_left=200
+        )
+        self.assertFalse(decision.should_trade)
+        self.assertIn("noise", decision.reason)
+
+    def test_less_time_increases_probability(self):
+        """With same price gap, less time remaining → higher probability."""
+        prob_early = self.engine._estimate_probability(diff_pct=0.05, seconds_left=250)
+        prob_late = self.engine._estimate_probability(diff_pct=0.05, seconds_left=30)
+        self.assertGreater(prob_late, prob_early)
+
+    def test_bigger_gap_increases_probability(self):
+        """With same time left, bigger gap → higher probability."""
+        prob_small = self.engine._estimate_probability(diff_pct=0.01, seconds_left=150)
+        prob_big = self.engine._estimate_probability(diff_pct=0.10, seconds_left=150)
+        self.assertGreater(prob_big, prob_small)
 
     def test_ev_calculation(self):
         decision = TradeDecision(
             should_trade=True,
-            direction="YES",
+            direction="UP",
             edge=0.10,
             confidence=0.7,
             price=0.50,

@@ -1,5 +1,12 @@
+# Secrets — NEVER commit
 .env
+
+# Data — transfer manually, not via git
 data/trades.db
+data/polybot.log*
+data/adaptive_state*.json
+
+# Python
 __pycache__/
 *.pyc
 .venv/
@@ -7,4 +14,8 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Bot control files
 EMERGENCY_STOP
+bot.log
+dashboard.log

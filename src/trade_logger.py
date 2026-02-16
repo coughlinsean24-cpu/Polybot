@@ -3,8 +3,12 @@ Trade logging and analytics using SQLite via SQLAlchemy.
 Records every signal, decision, and outcome for post-analysis.
 """
 
+import json
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import (
     Column,
@@ -12,8 +16,11 @@ from sqlalchemy import (
     Float,
     Integer,
     String,
+    Text,
+    text,
     Boolean,
     create_engine,
+    desc,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -27,6 +34,7 @@ class TradeRecord(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    session_id = Column(String, nullable=True)
 
     # BTC price data
     btc_price_start = Column(Float)
@@ -65,6 +73,7 @@ class SignalRecord(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    session_id = Column(String, nullable=True)
     direction = Column(String)
     delta_pct = Column(Float)
     confidence = Column(Float)
@@ -74,13 +83,75 @@ class SignalRecord(Base):
     reason = Column(String)  # why we did or didn't trade
 
 
+class BotSession(Base):
+    __tablename__ = "bot_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, unique=True, nullable=False)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ended_at = Column(DateTime, nullable=True)
+    mode = Column(String)  # "paper" or "live"
+    starting_bankroll = Column(Float)
+    ending_bankroll = Column(Float, nullable=True)
+    config_snapshot = Column(Text, nullable=True)
+
+
 class TradeLogger:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, paper_mode: bool = True):
         db_path = config["logging"]["db_path"]
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(f"sqlite:///{db_path}", echo=False)
         Base.metadata.create_all(self.engine)
+        self._migrate_add_columns()
         self.Session = sessionmaker(bind=self.engine)
-        logger.info(f"Trade logger initialized with DB: {db_path}")
+
+        # Cached P&L — invalidated when a trade outcome is updated
+        self._cached_pnl: float | None = None
+
+        # Create a new bot session record
+        self.session_id = str(uuid.uuid4())[:8]
+        session = self.Session()
+        try:
+            bot_session = BotSession(
+                session_id=self.session_id,
+                mode="paper" if paper_mode else "live",
+                starting_bankroll=config["strategy"].get("initial_bankroll", 200.0),
+                config_snapshot=json.dumps(config, indent=2),
+            )
+            session.add(bot_session)
+            session.commit()
+        finally:
+            session.close()
+
+        logger.info(f"Trade logger initialized with DB: {db_path} (session {self.session_id})")
+
+    def _migrate_add_columns(self):
+        """Add new columns to existing DBs without losing data."""
+        with self.engine.connect() as conn:
+            # Add session_id to trades if missing
+            try:
+                conn.execute(text("SELECT session_id FROM trades LIMIT 1"))
+            except Exception:
+                conn.execute(text("ALTER TABLE trades ADD COLUMN session_id TEXT"))
+                conn.commit()
+            # Add session_id to signals if missing
+            try:
+                conn.execute(text("SELECT session_id FROM signals LIMIT 1"))
+            except Exception:
+                conn.execute(text("ALTER TABLE signals ADD COLUMN session_id TEXT"))
+                conn.commit()
+
+    def end_session(self, ending_bankroll: float):
+        """Mark the current bot session as ended."""
+        session = self.Session()
+        try:
+            rec = session.query(BotSession).filter_by(session_id=self.session_id).first()
+            if rec:
+                rec.ended_at = datetime.now(timezone.utc)
+                rec.ending_bankroll = ending_bankroll
+                session.commit()
+        finally:
+            session.close()
 
     def log_trade(
         self,
@@ -104,6 +175,7 @@ class TradeLogger:
         session = self.Session()
         try:
             record = TradeRecord(
+                session_id=self.session_id,
                 btc_price_start=btc_price_start,
                 btc_price_end=btc_price_end,
                 delta_pct=delta_pct,
@@ -139,8 +211,9 @@ class TradeLogger:
         profit_loss: float,
         bankroll_after: float,
         consecutive_wins: int,
+        btc_price_close: float | None = None,
     ):
-        """Update a trade with its final outcome."""
+        """Update a trade with its final outcome and close price."""
         session = self.Session()
         try:
             record = session.query(TradeRecord).filter_by(id=trade_id).first()
@@ -149,7 +222,11 @@ class TradeLogger:
                 record.profit_loss = profit_loss
                 record.bankroll_after = bankroll_after
                 record.consecutive_wins = consecutive_wins
+                if btc_price_close is not None:
+                    record.btc_price_end = btc_price_close
                 session.commit()
+                # Invalidate P&L cache — next call will re-query
+                self._cached_pnl = None
                 logger.info(f"Trade {trade_id} updated: {outcome} P&L=${profit_loss:.2f}")
         finally:
             session.close()
@@ -164,10 +241,22 @@ class TradeLogger:
         traded: bool,
         reason: str,
     ):
-        """Log an arbitrage signal (whether traded or not)."""
+        """Log an arbitrage signal (whether traded or not).
+
+        Throttled: non-traded signals are only logged every 30s to reduce
+        DB writes.  Traded signals are always logged immediately.
+        """
+        now = time.time()
+        if not traded:
+            last = getattr(self, '_last_signal_time', 0.0)
+            if now - last < 30.0:
+                return  # skip — too soon since last non-trade signal
+            self._last_signal_time = now
+
         session = self.Session()
         try:
             record = SignalRecord(
+                session_id=self.session_id,
                 direction=direction,
                 delta_pct=delta_pct,
                 confidence=confidence,
@@ -181,8 +270,151 @@ class TradeLogger:
         finally:
             session.close()
 
-    def get_session_stats(self) -> dict:
-        """Get summary statistics for the current session."""
+    def get_orphaned_trades(self) -> list[dict]:
+        """Find PENDING trades from windows that have already ended.
+
+        These are trades whose 5-min window has passed but were never
+        resolved — typically because the bot crashed mid-session.
+        Returns a list of dicts with trade details needed for resolution.
+        """
+        import time as _time
+        session = self.Session()
+        try:
+            pending = (
+                session.query(TradeRecord)
+                .filter(TradeRecord.outcome == "PENDING")
+                .all()
+            )
+            orphans = []
+            now = _time.time()
+            for t in pending:
+                # Extract window timestamp from market_question or market_id
+                # The slug is stored indirectly — we can reconstruct from the
+                # timestamp.  A trade is orphaned if it's > 10 min old.
+                if t.timestamp is None:
+                    continue
+                # SQLite datetimes are naive — make them UTC-aware for comparison
+                ts = t.timestamp.replace(tzinfo=timezone.utc) if t.timestamp.tzinfo is None else t.timestamp
+                trade_age = (datetime.now(timezone.utc) - ts).total_seconds()
+                if trade_age > 600:  # > 10 minutes old = definitely orphaned
+                    orphans.append({
+                        "trade_id": t.id,
+                        "direction": t.direction,
+                        "bet_size": t.bet_size,
+                        "fill_price": t.fill_price,
+                        "btc_price_start": t.btc_price_start,
+                        "btc_price_end": t.btc_price_end,
+                        "market_question": t.market_question,
+                        "bankroll_before": t.bankroll_before,
+                        "timestamp": t.timestamp,
+                        "order_id": t.order_id,
+                    })
+            return orphans
+        finally:
+            session.close()
+
+    def get_last_bankroll(self) -> float | None:
+        """Get the last known bankroll from the most recent resolved trade.
+
+        Returns None if no prior trades exist (fresh start).
+        This lets us resume from where we left off after a restart.
+        """
+        session = self.Session()
+        try:
+            last_trade = (
+                session.query(TradeRecord)
+                .filter(TradeRecord.outcome != "PENDING")
+                .order_by(desc(TradeRecord.id))
+                .first()
+            )
+            if last_trade and last_trade.bankroll_after is not None:
+                return last_trade.bankroll_after
+            return None
+        finally:
+            session.close()
+
+    def get_bot_live_pnl(self) -> float:
+        """Get the bot's own net P&L from live (non-paper) trades only.
+
+        This sums profit_loss for all resolved live trades.  It does NOT
+        depend on the exchange balance — so manual trading by the user
+        from the same account is completely ignored.
+
+        Result is cached and invalidated when update_trade_outcome() is called.
+        """
+        if self._cached_pnl is not None:
+            return self._cached_pnl
+
+        session = self.Session()
+        try:
+            trades = (
+                session.query(TradeRecord)
+                .filter(
+                    TradeRecord.outcome != "PENDING",
+                    TradeRecord.paper_trade == False,  # noqa: E712
+                )
+                .all()
+            )
+            pnl = sum(t.profit_loss or 0.0 for t in trades)
+            self._cached_pnl = pnl
+            return pnl
+        finally:
+            session.close()
+
+    def get_cumulative_stats(self) -> dict:
+        """Get cumulative stats across ALL sessions (lifetime)."""
+        session = self.Session()
+        try:
+            trades = session.query(TradeRecord).filter(TradeRecord.outcome != "PENDING").all()
+            if not trades:
+                return {"total_trades": 0, "total_wins": 0, "total_pnl": 0.0}
+
+            wins = [t for t in trades if t.outcome == "WIN"]
+            losses = [t for t in trades if t.outcome == "LOSS"]
+            total_pnl = sum(t.profit_loss for t in trades)
+
+            return {
+                "total_trades": len(trades),
+                "total_wins": len(wins),
+                "total_losses": len(losses),
+                "total_pnl": total_pnl,
+                "win_rate": len(wins) / len(trades) if trades else 0,
+            }
+        finally:
+            session.close()
+
+    def get_session_stats(self, session_id: str | None = None) -> dict:
+        """Get summary statistics for a session (defaults to current)."""
+        sid = session_id or self.session_id
+        session = self.Session()
+        try:
+            query = session.query(TradeRecord).filter(TradeRecord.outcome != "PENDING")
+            if sid:
+                query = query.filter(TradeRecord.session_id == sid)
+            trades = query.all()
+            if not trades:
+                return {"total_trades": 0}
+
+            wins = [t for t in trades if t.outcome == "WIN"]
+            losses = [t for t in trades if t.outcome == "LOSS"]
+            total_pnl = sum(t.profit_loss for t in trades)
+
+            return {
+                "total_trades": len(trades),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": len(wins) / len(trades) if trades else 0,
+                "total_pnl": total_pnl,
+                "avg_win": sum(t.profit_loss for t in wins) / len(wins) if wins else 0,
+                "avg_loss": sum(t.profit_loss for t in losses) / len(losses) if losses else 0,
+                "largest_win": max((t.profit_loss for t in wins), default=0),
+                "largest_loss": min((t.profit_loss for t in losses), default=0),
+            }
+        finally:
+            session.close()
+
+    def get_all_stats(self) -> dict:
+        """Get stats across ALL sessions (for dashboard)."""
         session = self.Session()
         try:
             trades = session.query(TradeRecord).filter(TradeRecord.outcome != "PENDING").all()
