@@ -140,6 +140,10 @@ class Orchestrator:
         # Restore bankroll and stats from DB (survives restarts)
         self.position_manager.load_state_from_db(self.trade_logger)
 
+        # -- Strategy config --
+        strategy_cfg = config.get("strategy", {})
+        self._min_fill_price = strategy_cfg.get("min_fill_price", 0.30)
+
         # -- Straddle strategy state --
         straddle_cfg = config.get("straddle", {})
         self._straddle_enabled = straddle_cfg.get("enabled", False)
@@ -1852,16 +1856,16 @@ class Orchestrator:
                 self._last_priced_in_log[cache_key] = now
             return
 
-        # Floor: fill prices below 0.30 are junk bets -- 0% win rate
-        # on 23 historical trades.  Block them entirely.
-        if real_fill < 0.30:
+        # Floor: fill prices below min_fill_price are junk bets -- historically 0% win rate.
+        # Block them entirely.
+        if real_fill < self._min_fill_price:
             cache_key = f"floor_{market.slug}_{decision.direction}"
             last_log = getattr(self, '_last_priced_in_log', {})
             now = time.time()
             if now - last_log.get(cache_key, 0) > 30:
                 logger.info(
                     f">>  Fill price too low for {decision.direction}: "
-                    f"${real_fill:.2f} (<$0.30 floor) -- skipping (0% WR bucket)"
+                    f"${real_fill:.2f} (<${self._min_fill_price:.2f} floor) -- skipping (0% WR bucket)"
                 )
                 if not hasattr(self, '_last_priced_in_log'):
                     self._last_priced_in_log = {}
@@ -3422,7 +3426,8 @@ def main():
         old_pid = _PID_FILE.read_text().strip() if _PID_FILE.exists() else "?"
         logger.critical(
             f"Another Polybot instance is already running (PID {old_pid}). "
-            f"Kill it first or delete data/polybot.pid."
+            f"Kill it first or delete {_PID_FILE} if the file is stale "
+            f"(e.g., from a crash) and you're certain no other instance is running."
         )
         sys.exit(1)
 

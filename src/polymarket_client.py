@@ -207,8 +207,9 @@ class PolymarketClient:
             )
             resp = self.client.get_balance_allowance(params)
             raw = float(resp.get("balance", 0)) if isinstance(resp, dict) else 0
-            # Balance API always returns micro-units (6 decimals),
-            # same as collateral.  Always divide by 1e6.
+            # Balance API returns micro-units (6 decimals) in most cases.
+            # However, we apply heuristic detection in sell_position() since
+            # some scenarios may return values already in shares.
             return raw / 1e6
         except Exception:
             return 0.0
