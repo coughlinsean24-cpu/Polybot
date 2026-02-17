@@ -234,5 +234,208 @@ class TestKellySizing(unittest.TestCase):
         self.assertGreater(bet_large, bet_small)
 
 
+def make_compound_config():
+    """Config with smart compounding fully enabled."""
+    return {
+        "strategy": {
+            "initial_bet": 5,
+            "max_bet": 50,
+            "reset_profit_target": 200,
+            "min_bankroll": 5,
+            "min_price_delta": 0.15,
+            "min_edge": 0.05,
+            "max_slippage": 0.02,
+            "bet_mode": "kelly",
+            "kelly_fraction": 0.25,
+            "compound": {
+                "enabled": True,
+                "profit_reinvest_pct": 0.50,
+                "max_bet_pct": 0.10,
+                "floor": 10.0,
+                "ratchet_after": 5.0,
+                "gears": {
+                    "enabled": True,
+                    "cold_win_rate": 0.45,
+                    "hot_win_rate": 0.60,
+                    "cold_reinvest_pct": 0.25,
+                    "hot_reinvest_pct": 0.70,
+                },
+                "drawdown": {
+                    "enabled": True,
+                    "threshold": 0.15,
+                    "multiplier": 0.50,
+                    "severe_threshold": 0.30,
+                    "severe_multiplier": 0.25,
+                },
+                "streak": {
+                    "enabled": True,
+                    "threshold": 3,
+                    "boost_pct": 0.25,
+                    "max_boost": 2.0,
+                },
+                "lock_in": {
+                    "enabled": True,
+                    "pct": 0.10,
+                },
+            },
+        },
+        "risk": {
+            "max_concurrent_positions": 1,
+            "cooldown_after_loss": 30,
+            "max_consecutive_losses": 5,
+        },
+    }
+
+
+class TestSmartCompounding(unittest.TestCase):
+    """Tests for the gear-shifting compound system."""
+
+    def setUp(self):
+        self.pm = PositionManager(make_compound_config())
+        self.pm.bankroll = 200.0
+        self.pm.high_water_mark = 200.0
+
+    def test_compound_enabled(self):
+        self.assertTrue(self.pm.compound_enabled)
+        self.assertTrue(self.pm.gear_enabled)
+        self.assertTrue(self.pm.drawdown_enabled)
+        self.assertTrue(self.pm.streak_enabled)
+        self.assertTrue(self.pm.lockin_enabled)
+
+    def test_gear_starts_normal(self):
+        self.assertEqual(self.pm._current_gear, "normal")
+
+    def test_gear_shifts_hot_on_high_win_rate(self):
+        """After enough wins, gear should shift to 'hot'."""
+        # 4 wins, 1 loss => 80% WR (above hot threshold of 60%)
+        for _ in range(4):
+            self.pm.update_after_win(5)
+        self.pm._last_loss_time = 0  # clear cooldown
+        self.pm.update_after_loss(5)
+        # 5 trades, 80% WR
+        self.assertEqual(self.pm._current_gear, "hot")
+
+    def test_gear_shifts_cold_on_low_win_rate(self):
+        """After many losses, gear should shift to 'cold'."""
+        # 1 win, 4 losses => 20% WR
+        self.pm.update_after_win(5)
+        for _ in range(4):
+            self.pm._last_loss_time = 0
+            self.pm.update_after_loss(5)
+        self.assertEqual(self.pm._current_gear, "cold")
+
+    def test_hot_gear_reinvests_more(self):
+        """Hot gear should use 70% reinvest vs normal 50%."""
+        self.pm._current_gear = "hot"
+        self.assertEqual(self.pm._get_gear_reinvest_pct(), 0.70)
+
+    def test_cold_gear_reinvests_less(self):
+        """Cold gear should use 25% reinvest."""
+        self.pm._current_gear = "cold"
+        self.assertEqual(self.pm._get_gear_reinvest_pct(), 0.25)
+
+    def test_high_water_mark_updates_on_win(self):
+        """HWM should go up when bankroll hits new peak."""
+        initial_hwm = self.pm.high_water_mark
+        self.pm.update_after_win(10)
+        self.assertGreater(self.pm.high_water_mark, initial_hwm)
+        self.assertEqual(self.pm.high_water_mark, self.pm.bankroll)
+
+    def test_high_water_mark_stays_on_loss(self):
+        """HWM should NOT go down on a loss."""
+        self.pm.update_after_win(10)
+        hwm_after_win = self.pm.high_water_mark
+        self.pm._last_loss_time = 0
+        self.pm.update_after_loss(5)
+        self.assertEqual(self.pm.high_water_mark, hwm_after_win)
+
+    def test_lock_in_raises_floor_on_win(self):
+        """10% of each win should be locked into the floor."""
+        old_floor = self.pm.compound_floor
+        self.pm.update_after_win(10.0)
+        # 10% of $10 = $1 locked
+        expected_floor = old_floor + 1.0
+        # Ratchet may also fire, so floor should be >= expected
+        self.assertGreaterEqual(self.pm.compound_floor, expected_floor)
+
+    def test_ratchet_raises_floor_on_headroom(self):
+        """Floor should ratchet up when bankroll is $5+ above floor."""
+        self.pm.compound_floor = 10.0
+        self.pm.bankroll = 20.0  # $10 above floor, > ratchet_after=$5
+        self.pm.update_after_win(5.0)
+        # lock_in adds $0.50, then ratchet fires because headroom >= $5
+        self.assertGreater(self.pm.compound_floor, 10.0)
+
+    def test_drawdown_throttle_moderate(self):
+        """Bet should be throttled at 15%+ drawdown from peak."""
+        self.pm.bankroll = 200.0
+        self.pm.high_water_mark = 240.0  # 16.7% drawdown
+        normal_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+        # The bet should be cut by drawdown_multiplier (0.50)
+        # Since it's a moderate drawdown, the bet should be < what it would be
+        # without drawdown protection
+        self.pm.drawdown_enabled = False
+        unthrottled_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+        self.pm.drawdown_enabled = True
+        self.assertLess(normal_bet, unthrottled_bet)
+
+    def test_drawdown_throttle_severe(self):
+        """Bet should be heavily throttled at 30%+ drawdown."""
+        self.pm.bankroll = 140.0
+        self.pm.high_water_mark = 200.0  # 30% drawdown
+        severe_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+        # Should be cut to 25% of base
+        self.pm.drawdown_enabled = False
+        unthrottled_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+        self.pm.drawdown_enabled = True
+        self.assertLess(severe_bet, unthrottled_bet)
+
+    def test_streak_boost_activates(self):
+        """After 3 consecutive wins, bet should get streak bonus."""
+        self.pm.bankroll = 200.0
+        self.pm.high_water_mark = 200.0
+        self.pm.consecutive_wins = 2
+        base_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+
+        self.pm.consecutive_wins = 4  # 2 levels above threshold of 3
+        streak_bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+
+        self.assertGreater(streak_bet, base_bet)
+
+    def test_streak_boost_capped(self):
+        """Streak boost should never exceed max_boost (2x)."""
+        self.pm.bankroll = 500.0
+        self.pm.high_water_mark = 500.0
+        self.pm.consecutive_wins = 100  # huge streak
+        bet = self.pm.calculate_bet_size(edge=0.10, probability=0.60)
+        # Even with 100 wins, boost is capped at 2x, and overall bet capped at max_bet
+        self.assertLessEqual(bet, self.pm.max_bet)
+
+    def test_floor_never_decreases(self):
+        """The compound floor should only go up, never down."""
+        self.pm.update_after_win(10)
+        floor_after_win = self.pm.compound_floor
+        self.pm._last_loss_time = 0
+        self.pm.update_after_loss(10)
+        self.assertEqual(self.pm.compound_floor, floor_after_win)
+
+    def test_compounding_summary(self):
+        """get_compounding_summary should return all expected keys."""
+        summary = self.pm.get_compounding_summary()
+        expected_keys = {
+            "gear", "win_rate", "high_water_mark", "compound_floor",
+            "drawdown_pct", "reinvest_pct", "streak_bonus_active",
+            "protected_profit",
+        }
+        self.assertEqual(set(summary.keys()), expected_keys)
+
+    def test_compound_bet_never_below_initial(self):
+        """With compounding enabled, bet should still be >= initial_bet."""
+        self.pm.bankroll = 11.0  # just above floor
+        self.pm.high_water_mark = 200.0  # big drawdown
+        bet = self.pm.calculate_bet_size(edge=0.05, probability=0.55)
+        self.assertGreaterEqual(bet, self.pm.initial_bet)
+
+
 if __name__ == "__main__":
     unittest.main()

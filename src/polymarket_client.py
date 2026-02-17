@@ -12,6 +12,7 @@ Market structure (discovered via gamma-api.polymarket.com):
 """
 
 import json
+import math
 import logging
 import re
 import time
@@ -28,20 +29,31 @@ POLYMARKET_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 MARKET_WINDOW_SECONDS = 300  # 5 minutes
 
-# Simple in-memory caches keyed by slug — avoids repeated API/scrape calls
+# Simple in-memory caches keyed by slug -- avoids repeated API/scrape calls
 _market_cache: dict[str, "MarketInfo | None"] = {}
 _price_to_beat_cache: dict[str, float | None] = {}
+_price_to_beat_neg_cache: dict[str, float] = {}   # slug -> time.time() of last failure
+_PRICE_NEG_CACHE_TTL = 30.0                        # don't re-scrape a failing slug for 30s
 _close_price_cache: dict[str, float | None] = {}
 
-# TTL caches for hot-path calls (keyed by slug → (value, timestamp))
-_live_price_cache: dict[str, tuple[dict | None, float]] = {}
-_LIVE_PRICE_TTL = 0.0  # Always fetch fresh — 5-min markets move too fast for caching
-
 _market_slug_cache: dict[str, tuple["MarketInfo | None", float]] = {}
-_MARKET_SLUG_TTL = 15.0  # seconds — same window, same market info
+_MARKET_SLUG_TTL = 15.0  # seconds -- same window, same market info
 
 # Shared requests.Session for connection pooling (reuses TCP connections)
 _http_session: requests.Session | None = None
+
+# WebSocket streams (set by Orchestrator on startup)
+_market_stream = None  # PolymarketMarketStream instance
+_user_stream = None    # PolymarketUserStream instance
+
+
+def set_ws_streams(market_stream=None, user_stream=None):
+    """Inject WebSocket stream references (called by Orchestrator on startup)."""
+    global _market_stream, _user_stream
+    if market_stream is not None:
+        _market_stream = market_stream
+    if user_stream is not None:
+        _user_stream = user_stream
 
 
 def _get_http_session() -> requests.Session:
@@ -49,7 +61,15 @@ def _get_http_session() -> requests.Session:
     global _http_session
     if _http_session is None:
         _http_session = requests.Session()
-        _http_session.headers.update({"User-Agent": "Mozilla/5.0"})
+        _http_session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
     return _http_session
 
 
@@ -121,13 +141,13 @@ class PolymarketClient:
         )
         self._authenticated = False
 
-    # ── Authentication ──────────────────────────────────────────────
+    # -- Authentication ----------------------------------------------
 
     def authenticate(self) -> bool:
         """Authenticate with Polymarket CLOB API.
 
         Derives API credentials directly from the wallet private key.
-        This is the most reliable approach — it guarantees the API key,
+        This is the most reliable approach -- it guarantees the API key,
         secret, and passphrase match the signing wallet, even if the
         values stored in .env are stale or from a different wallet.
         """
@@ -157,7 +177,7 @@ class PolymarketClient:
             logger.error(f"Polymarket authentication failed: {e}")
             return False
 
-    # ── Balance ───────────────────────────────────────────────────
+    # -- Balance ---------------------------------------------------
 
     def get_live_balance(self) -> float | None:
         """Query the real USDC balance available for trading on Polymarket.
@@ -174,7 +194,26 @@ class PolymarketClient:
             logger.error(f"Failed to fetch live balance: {e}")
             return None
 
-    # ── Market Discovery (gamma-api) ────────────────────────────────
+    def get_position_balance(self, token_id: str) -> float:
+        """Return number of shares held for a specific conditional token.
+
+        Returns 0.0 if no shares or on any error.
+        """
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            )
+            resp = self.client.get_balance_allowance(params)
+            raw = float(resp.get("balance", 0)) if isinstance(resp, dict) else 0
+            # Balance API always returns micro-units (6 decimals),
+            # same as collateral.  Always divide by 1e6.
+            return raw / 1e6
+        except Exception:
+            return 0.0
+
+    # -- Market Discovery (gamma-api) --------------------------------
 
     @staticmethod
     def _current_window_ts() -> int:
@@ -190,7 +229,7 @@ class PolymarketClient:
     def _fetch_market_by_slug(slug: str) -> MarketInfo | None:
         """Fetch a single BTC Up/Down market from gamma-api by its slug.
 
-        Cached with a 15s TTL — same 5-min window returns identical data.
+        Cached with a 15s TTL -- same 5-min window returns identical data.
         """
         now = time.time()
         cached = _market_slug_cache.get(slug)
@@ -238,55 +277,11 @@ class PolymarketClient:
             _market_slug_cache[slug] = (None, time.time())
             return None
 
-    def get_active_5min_markets(self) -> list[MarketInfo]:
-        """
-        Fetch the current and next BTC Up/Down 5-min markets.
-
-        Returns up to 2 markets: the one currently in-play and the upcoming one.
-        The CLOB API get_markets() endpoint does NOT surface these rolling
-        markets, so we query gamma-api.polymarket.com using the predictable
-        slug pattern:  btc-updown-5m-{unix_timestamp}
-        """
-        found: list[MarketInfo] = []
-
-        for ts in [self._current_window_ts(), self._next_window_ts()]:
-            slug = f"btc-updown-5m-{ts}"
-            mkt = self._fetch_market_by_slug(slug)
-            if mkt:
-                # Only include markets that are still accepting orders
-                found.append(mkt)
-                logger.debug(
-                    f"Found market: {mkt.question}  Up={mkt.up_price:.3f} "
-                    f"Down={mkt.down_price:.3f}"
-                )
-
-        logger.info(f"Found {len(found)} active 5-min BTC Up/Down markets")
-        return found
-
-    def get_next_market(self) -> MarketInfo | None:
-        """
-        Get the NEXT (upcoming) 5-min market that hasn't started yet.
-        This is the one we want to trade on — place orders before it begins.
-        """
-        slug = f"btc-updown-5m-{self._next_window_ts()}"
-        mkt = self._fetch_market_by_slug(slug)
-        if mkt:
-            logger.info(
-                f"Next market: {mkt.question}  Up={mkt.up_price:.3f} "
-                f"Down={mkt.down_price:.3f}"
-            )
-        return mkt
-
-    def get_current_market(self) -> MarketInfo | None:
-        """Get the currently in-play 5-min market."""
-        slug = f"btc-updown-5m-{self._current_window_ts()}"
-        return self._fetch_market_by_slug(slug)
-
     @staticmethod
     def _slug_to_iso_start(slug: str) -> str | None:
         """Convert a slug like 'btc-updown-5m-1771187100' to ISO start time.
 
-        Returns e.g. '2026-02-15T20:25:00Z' — the key Polymarket uses in its
+        Returns e.g. '2026-02-15T20:25:00Z' -- the key Polymarket uses in its
         SSR React-Query dehydrated state for this specific window.
         """
         match = re.search(r"(\d{10})$", slug)
@@ -331,9 +326,15 @@ class PolymarketClient:
                 logger.debug(f"Price to beat for {slug}: ${cached:,.2f} (cached)")
                 return cached
 
+        # Negative cache: don't hammer a slug that recently failed
+        neg_ts = _price_to_beat_neg_cache.get(slug)
+        if neg_ts is not None and (time.time() - neg_ts) < _PRICE_NEG_CACHE_TTL:
+            return None
+
         iso_start = PolymarketClient._slug_to_iso_start(slug)
         page = PolymarketClient._scrape_event_page(slug)
         if page is None:
+            _price_to_beat_neg_cache[slug] = time.time()
             return None
 
         # Strategy 1: Match the window-specific past-results key
@@ -367,7 +368,7 @@ class PolymarketClient:
                 except (json.JSONDecodeError, KeyError, ValueError):
                     pass
 
-        # Strategy 3: Fallback — first openPrice near any past-results key
+        # Strategy 3: Fallback -- first openPrice near any past-results key
         match = re.search(
             r'"past-results","BTC","fiveminute".*?"openPrice":([\d.]+)', page
         )
@@ -433,16 +434,16 @@ class PolymarketClient:
                 except (json.JSONDecodeError, KeyError, ValueError):
                     pass
 
-        # NO generic fallback for closePrice — grabbing a random closePrice
+        # NO generic fallback for closePrice -- grabbing a random closePrice
         # from the page is worse than returning None and retrying, because
         # it will resolve our trade against the wrong window's data.
         logger.debug(f"Close price not yet available for {slug}")
         return None
 
-    # ── Live Market Prices (via gamma-api) ──────────────────────────
+    # -- Live Market Prices (via gamma-api) --------------------------
     #
     # IMPORTANT: The raw CLOB order book per-token only shows that
-    # token's native orders (e.g. UP book has bids at 1¢, no asks).
+    # token's native orders (e.g. UP book has bids at 1c, no asks).
     # However Polymarket uses neg-risk complement matching: buying UP
     # at 0.49 is matched against selling DOWN at 0.51 under the hood.
     # The gamma-api's bestAsk/bestBid/outcomePrices reflect the REAL
@@ -450,10 +451,10 @@ class PolymarketClient:
 
     @staticmethod
     def get_live_market_price(slug: str) -> dict | None:
-        """Re-fetch the latest market prices from gamma-api.
+        """Get the latest market prices -- WebSocket first, HTTP fallback.
 
-        Cached with a 4s TTL — avoids hitting gamma-api multiple times
-        within the same scan cycle (scan interval = 3s).
+        Tries the WS market stream for instant, zero-latency data.
+        Falls back to HTTP polling if WS is not connected or data is stale.
 
         Returns a dict with the real tradeable prices::
 
@@ -465,15 +466,21 @@ class PolymarketClient:
                 'spread': float,       # ask - bid
             }
 
-        These prices account for complement matching — the gamma-api
+        These prices account for complement matching -- the gamma-api
         aggregates both sides of the book.  A BUY UP at best_ask WILL
         fill immediately.
         """
-        now = time.time()
-        cached = _live_price_cache.get(slug)
-        if cached and (now - cached[1]) < _LIVE_PRICE_TTL:
-            return cached[0]
+        # --- Try WebSocket stream first (sub-second latency) ---
+        if _market_stream and _market_stream.connected:
+            ws_data = _market_stream.get_live_prices(slug)
+            if ws_data:
+                logger.debug(
+                    f"[WS] Live prices [{slug}]: UP={ws_data['up_price']:.3f} "
+                    f"ask={ws_data['best_ask']:.3f} bid={ws_data['best_bid']:.3f}"
+                )
+                return ws_data
 
+        # --- Fall back to HTTP polling ---
         try:
             resp = _get_http_session().get(
                 f"{GAMMA_API}/events",
@@ -497,25 +504,81 @@ class PolymarketClient:
             }
 
             logger.debug(
-                f"Live prices [{slug}]: UP={result['up_price']:.3f} "
+                f"[HTTP] Live prices [{slug}]: UP={result['up_price']:.3f} "
                 f"ask={result['best_ask']:.3f} bid={result['best_bid']:.3f} "
                 f"spread={result['spread']:.3f}"
             )
-            _live_price_cache[slug] = (result, time.time())
             return result
 
         except Exception as e:
             logger.warning(f"Failed to fetch live prices for {slug}: {e}")
             return None
 
-    def get_current_odds(self, market: MarketInfo) -> tuple[float, float]:
-        """Get live Up/Down prices from gamma-api (includes complement matching)."""
-        live = self.get_live_market_price(market.slug)
-        if live:
-            return live["up_price"], live["down_price"]
-        return market.up_price, market.down_price
+    @staticmethod
+    def check_clob_book(token_id: str, max_price: float = 0.95) -> dict | None:
+        """Query the real CLOB order book for a token.
 
-    # ── Order Execution ─────────────────────────────────────────────
+        Returns the best ask and total available size at or below max_price.
+        This bypasses the gamma API which can report stale prices.
+
+        Returns::
+
+            {
+                'best_ask': float | None,   # lowest ask price, or None if empty
+                'ask_size': float,           # total askable shares <= max_price
+                'best_bid': float | None,    # highest bid price, or None if empty
+                'bid_size': float,           # total biddable shares
+                'liquid': bool,              # True if there's real tradeable liquidity
+            }
+        """
+        try:
+            import httpx
+            resp = httpx.get(
+                f"{POLYMARKET_HOST}/book",
+                params={"token_id": token_id},
+                timeout=4,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            asks = data.get("asks", [])
+            bids = data.get("bids", [])
+
+            # Filter asks to those at or below our max willingness to pay
+            valid_asks = [
+                a for a in asks
+                if float(a.get("price", 999)) <= max_price
+            ]
+            valid_asks.sort(key=lambda a: float(a["price"]))
+
+            best_ask = float(valid_asks[0]["price"]) if valid_asks else None
+            ask_size = sum(float(a.get("size", 0)) for a in valid_asks)
+
+            best_bid = float(bids[0]["price"]) if bids else None
+            bid_size = sum(float(b.get("size", 0)) for b in bids[:10])
+
+            # "Liquid" means there's at least one ask below 0.90 with at
+            # least 5 shares available (the minimum order size)
+            liquid = best_ask is not None and best_ask < 0.90 and ask_size >= 5
+
+            logger.debug(
+                f"[BOOK] token={token_id[:12]}... "
+                f"best_ask={best_ask} ask_size={ask_size:.1f} "
+                f"best_bid={best_bid} bid_size={bid_size:.1f} "
+                f"liquid={liquid}"
+            )
+            return {
+                "best_ask": best_ask,
+                "ask_size": ask_size,
+                "best_bid": best_bid,
+                "bid_size": bid_size,
+                "liquid": liquid,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to check CLOB book: {e}")
+            return None
+
+    # -- Order Execution ---------------------------------------------
 
     def place_order(
         self, market: MarketInfo, side: str, size: float, price: float,
@@ -546,13 +609,12 @@ class PolymarketClient:
             token_id = market.down_token_id
 
         # Round price to valid tick size (0.01 for most markets, 0.001 for some)
-        # Use 0.01 as default — Polymarket will reject invalid ticks
+        # Use 0.01 as default -- Polymarket will reject invalid ticks
         tick_size = 0.01
         price = round(price / tick_size) * tick_size
         price = max(tick_size, min(price, 1.0 - tick_size))
 
         try:
-            import math
             shares = size / price
 
             # Polymarket enforces a minimum order size of 5 shares
@@ -579,7 +641,7 @@ class PolymarketClient:
                     return OrderResult(success=False, error="Below minimum order size")
 
             if order_type == "FOK":
-                # FOK uses MarketOrderArgs with amount (USDC) — the library's
+                # FOK uses MarketOrderArgs with amount (USDC) -- the library's
                 # create_market_order handles precision correctly (maker to 2dp).
                 from py_clob_client.clob_types import MarketOrderArgs
                 market_args = MarketOrderArgs(
@@ -630,10 +692,29 @@ class PolymarketClient:
             logger.error(f"Order placement failed: {e}")
             return OrderResult(success=False, error=str(e))
 
-    # ── Position Management ─────────────────────────────────────────
+    # -- Position Management -----------------------------------------
 
     def check_position_status(self, order_id: str) -> dict:
-        """Check the status of an existing order/position."""
+        """Check the status of an existing order/position.
+
+        Tries WebSocket cache first for instant results, falls back
+        to HTTP if no WS data is available.
+        """
+        # --- Try WebSocket user stream cache first ---
+        if _user_stream and _user_stream.connected:
+            ws_update = _user_stream.get_order_status(order_id)
+            if ws_update:
+                logger.debug(
+                    f"[WS] Order {order_id[:12]}... -> "
+                    f"{ws_update.status} (matched={ws_update.size_matched})"
+                )
+                return {
+                    "status": ws_update.status.lower(),
+                    "filled": ws_update.size_matched,
+                    "remaining": ws_update.original_size - ws_update.size_matched,
+                }
+
+        # --- Fall back to HTTP ---
         try:
             order = self.client.get_order(order_id)
             return {
@@ -668,7 +749,7 @@ class PolymarketClient:
 
         Args:
             market: The market to trade on
-            side: "UP" or "DOWN" — which token to sell
+            side: "UP" or "DOWN" -- which token to sell
             shares: Number of shares to sell
             price: Min price to sell at (0-1)
             order_type: "GTC" (default) or "FOK"
@@ -689,14 +770,14 @@ class PolymarketClient:
             MIN_SHARES = 5
             if shares < MIN_SHARES:
                 logger.warning(
-                    f"Cannot sell {shares:.2f} shares (min {MIN_SHARES}) — "
+                    f"Cannot sell {shares:.2f} shares (min {MIN_SHARES}) -- "
                     f"will hold to resolution"
                 )
                 return OrderResult(success=False, error="Below minimum shares")
 
             # Approve conditional token for selling (required after buy settles)
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             try:
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
                 params = BalanceAllowanceParams(
                     asset_type=AssetType.CONDITIONAL,
                     token_id=token_id,
@@ -704,6 +785,45 @@ class PolymarketClient:
                 self.client.update_balance_allowance(params)
             except Exception as e:
                 logger.debug(f"update_balance_allowance: {e}")
+
+            # Check actual conditional token balance before attempting sell.
+            # Polymarket conditional tokens use 6 decimals on Polygon, so
+            # the raw balance is in micro-units (balance / 1e6 = shares).
+            try:
+                bal_params = BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+                bal_resp = self.client.get_balance_allowance(bal_params)
+                raw_bal = float(bal_resp.get("balance", 0)) if isinstance(bal_resp, dict) else 0
+
+                # Determine if raw_bal is in micro-units or direct shares
+                # If raw_bal is > 1000x shares, it's almost certainly in micro-units
+                if raw_bal > shares * 1000:
+                    actual_shares = raw_bal / 1e6
+                else:
+                    actual_shares = raw_bal
+
+                logger.info(
+                    f"Conditional token balance: raw={raw_bal:.0f} "
+                    f"(~{actual_shares:.4f} shares, need {shares:.4f})"
+                )
+
+                if actual_shares < shares:
+                    if actual_shares >= 5.0:  # above minimum, sell what we have
+                        logger.info(
+                            f"Adjusting sell from {shares:.4f} -> {actual_shares:.4f} shares "
+                            f"(on-chain balance)"
+                        )
+                        shares = math.floor(actual_shares * 100) / 100  # round down
+                    else:
+                        return OrderResult(
+                            success=False,
+                            error=f"not enough balance / allowance "
+                                  f"(have {actual_shares:.4f}, need {shares:.4f})"
+                        )
+            except Exception as e:
+                logger.debug(f"get_balance_allowance: {e}")
 
             otype = OrderType.GTC if order_type == "GTC" else OrderType.FOK
 
@@ -728,7 +848,7 @@ class PolymarketClient:
             proceeds = shares * price
             logger.info(
                 f"Sell order placed: {side} {shares:.2f} shares @ {price:.3f} "
-                f"(proceeds~${proceeds:.2f}) → order_id={order_id} status={status}"
+                f"(proceeds~${proceeds:.2f}) -> order_id={order_id} status={status}"
             )
 
             return OrderResult(
@@ -790,7 +910,7 @@ class PolymarketClient:
             cost = shares * price
             logger.info(
                 f"Limit order placed: {side} {shares:.0f} shares @ ${price:.2f} "
-                f"(cost=${cost:.2f}) → order_id={order_id} status={status}"
+                f"(cost=${cost:.2f}) -> order_id={order_id} status={status}"
             )
 
             return OrderResult(

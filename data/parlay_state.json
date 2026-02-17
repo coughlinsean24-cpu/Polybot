@@ -1,0 +1,23 @@
+{
+  "enabled": false,
+  "active": false,
+  "current_stake": 1.0,
+  "round": 0,
+  "streak_profit": 0.0,
+  "initial_stake": 1.0,
+  "max_rounds": 8,
+  "take_profit": 100.0,
+  "potential_next_win": 1.0,
+  "lifetime_profit": 6.222424874066354,
+  "lifetime_lost": 0.0,
+  "lifetime_net": 6.222424874066354,
+  "history": [
+    {
+      "rounds": 2,
+      "result": "PASS",
+      "profit": 6.222424874066354,
+      "reason": "stopped",
+      "ended_at": "2026-02-16 14:47:29"
+    }
+  ]
+}

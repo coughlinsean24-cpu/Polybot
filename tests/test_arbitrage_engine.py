@@ -85,10 +85,10 @@ class TestArbitrageEngine(unittest.TestCase):
         self.assertGreater(decision.edge, 0.05)
 
     def test_rejects_too_close_to_expiry(self):
-        """Should not trade in the last 60 seconds."""
+        """Should not trade in the last 30 seconds."""
         market = make_market(up_price=0.50, down_price=0.50)
         decision = self.engine.analyze_opportunity(
-            btc_price=68700, target_price=68500, market=market, seconds_left=50
+            btc_price=68700, target_price=68500, market=market, seconds_left=20
         )
         self.assertFalse(decision.should_trade)
         self.assertIn("expiry", decision.reason)
