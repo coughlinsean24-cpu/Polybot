@@ -5,6 +5,9 @@
 data/trades.db
 data/polybot.log*
 data/adaptive_state*.json
+data/polybot.pid
+data/parlay_state.json
+data/parlay_control.json
 
 # Python
 __pycache__/
