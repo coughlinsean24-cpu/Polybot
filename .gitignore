@@ -19,3 +19,10 @@ build/
 EMERGENCY_STOP
 bot.log
 dashboard.log
+
+# AI news-trader runtime files
+data/news_trader.db*
+data/news_replay.db*
+data/news_trader.log*
+data/news_trader_status.json
+NEWS_TRADER_HALT

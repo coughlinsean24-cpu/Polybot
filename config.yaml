@@ -59,3 +59,43 @@ risk:
 logging:
   db_path: ./data/trades.db
   log_level: INFO
+# ── AI news-trading engine (src/news_trader) ── isolated from the BTC engine.
+# Paper mode only. "mode: live" alone does NOT enable real orders: see
+# execution.LiveAuthorization (code release flag, CLI flag, env acknowledgement,
+# Polymarket geoblock check, credentials). Omitted keys use defaults in
+# src/news_trader/config.py.
+news_trader:
+  enabled: true
+  mode: paper
+  emergency_stop: false
+  categories: [monetary_policy, economics, corporate, politics, geopolitics, crypto, sports, general]
+  sources:
+    min_credibility: 0.6
+    user_agent: "Polybot-NewsTrader/1.0 (research; contact: set-your-email@example.com)"
+  ai:
+    provider: anthropic
+    model: claude-opus-5-5
+    effort: medium
+    max_calls_per_day: 60
+    daily_budget_usd: 3.0
+    probability_weight: 0.5
+  risk:
+    max_trade_usd: 10.0
+    max_market_exposure_usd: 20.0
+    max_daily_exposure_usd: 100.0
+    max_correlated_exposure_usd: 30.0
+    max_open_positions: 10
+    daily_loss_limit_usd: 30.0
+    min_edge: 0.04
+    min_confidence: 0.6
+    max_uncertainty: 0.25
+    max_news_age_seconds: 900
+    max_decision_latency_seconds: 120
+    max_quote_age_seconds: 10
+    max_spread: 0.06
+    paper_bankroll_usd: 500.0
+  execution:
+    order_timeout_seconds: 30
+    paper_depth_haircut: 0.5
+    paper_latency_ms: 500
+    exit_policy: hold_to_resolution
