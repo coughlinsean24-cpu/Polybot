@@ -6,6 +6,7 @@ Reads from the same SQLite database and controls the EMERGENCY_STOP file.
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +15,20 @@ from flask import Flask, jsonify, render_template_string, request
 from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
+
+# AI News Trader tab (isolated engine; see src/news_trader/dashboard.py).
+# A failure in the news module must never take down this dashboard.
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+try:
+    from src.news_trader.dashboard import news_bp
+    app.register_blueprint(news_bp)
+except Exception as _news_err:  # pragma: no cover - defensive
+    _news_err_text = f"{type(_news_err).__name__}: {_news_err}"
+
+    @app.route("/news")
+    def news_unavailable():
+        return f"AI News Trader tab unavailable: {_news_err_text}", 503
 
 # Resolve paths relative to project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -679,6 +694,7 @@ DASHBOARD_HTML = """
         <div class="tabs">
             <button id="tabPaper" class="tab active" onclick="setMode('paper')">Paper</button>
             <button id="tabLive" class="tab" onclick="setMode('live')">Live</button>
+            <a class="tab" href="/news" style="text-decoration:none">🤖 AI News Trader</a>
         </div>
         <div class="status">
             <div id="statusDot" class="status-dot running"></div>
